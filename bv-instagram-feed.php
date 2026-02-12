@@ -1,0 +1,401 @@
+<?php
+/*
+Plugin Name: BV Instagram Feed
+Description: Lightweight Instagram grid + token refresh for Boardwalk Vintage.
+Version: 0.1.0
+Author: Boardwalk Vintage
+*/
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Config: Settings → BV Instagram Feed, or constants BV_IG_TOKEN, BV_IG_USER_ID.
+ * Shortcode: [bv_instagram_grid limit="12" cols="4"]
+ * Verify: GET /wp-json/bv/v1/instagram-verify
+ * Filter: bv_instagram_media_cache_seconds (default 30 min) to tune media cache TTL.
+ *
+ * Rate limits (Meta app-level): 200 × number of users per hour. We use: media (cached),
+ * ig user id (cached 24h), token refresh (1×/day). Increase cache TTL on high-traffic sites.
+ */
+
+// Option names.
+const BV_IG_OPTION_TOKEN  = 'bv_ig_token';
+const BV_IG_OPTION_IG_ID  = 'bv_ig_user_id';
+
+/**
+ * Get current token.
+ * Priority: option -> BV_IG_TOKEN constant -> BV_IG_TOKEN env.
+ */
+function bv_instagram_get_token() {
+	$token = get_option( BV_IG_OPTION_TOKEN );
+	if ( ! $token && defined( 'BV_IG_TOKEN' ) && BV_IG_TOKEN ) {
+		$token = BV_IG_TOKEN;
+	} elseif ( ! $token && getenv( 'BV_IG_TOKEN' ) ) {
+		$token = getenv( 'BV_IG_TOKEN' );
+	}
+	return apply_filters( 'bv_instagram_access_token', $token );
+}
+
+/**
+ * Resolve Instagram Business/Creator user id.
+ * Priority: BV_IG_USER_ID constant -> option -> transient -> /me/accounts.
+ */
+function bv_instagram_get_ig_user_id( $token ) {
+	if ( empty( $token ) ) {
+		return null;
+	}
+
+	// Constant (e.g. bv-secrets) overrides option so wrong saved id doesn't stick.
+	if ( defined( 'BV_IG_USER_ID' ) && BV_IG_USER_ID ) {
+		return BV_IG_USER_ID;
+	}
+
+	$manual = get_option( BV_IG_OPTION_IG_ID );
+	if ( is_string( $manual ) && $manual !== '' ) {
+		return $manual;
+	}
+
+	$cached = get_transient( 'bv_ig_user_id' );
+	if ( is_string( $cached ) && $cached ) {
+		return $cached;
+	}
+
+	$endpoint = add_query_arg(
+		array(
+			'fields'       => 'id,name,instagram_business_account',
+			'limit'        => 50,
+			'access_token' => $token,
+		),
+		'https://graph.facebook.com/v24.0/me/accounts'
+	);
+
+	$response = wp_remote_get( $endpoint, array( 'timeout' => 10 ) );
+	if ( is_wp_error( $response ) ) {
+		return null;
+	}
+
+	$code = wp_remote_retrieve_response_code( $response );
+	$body = json_decode( wp_remote_retrieve_body( $response ), true );
+	if ( $code < 200 || $code >= 300 || ! is_array( $body ) || empty( $body['data'] ) ) {
+		return null;
+	}
+
+	$ig_user_id = null;
+	foreach ( (array) $body['data'] as $page ) {
+		if ( ! empty( $page['instagram_business_account']['id'] ) ) {
+			$ig_user_id = $page['instagram_business_account']['id'];
+			break;
+		}
+	}
+
+	if ( ! $ig_user_id ) {
+		return null;
+	}
+
+	set_transient( 'bv_ig_user_id', $ig_user_id, 24 * HOUR_IN_SECONDS );
+	return $ig_user_id;
+}
+
+function bv_instagram_fetch_media( $limit = 12 ) {
+	$limit = max( 1, min( 20, (int) $limit ) );
+	$cache_key = 'bv_ig_media_' . $limit;
+	$cached = get_transient( $cache_key );
+	if ( $cached !== false ) {
+		return $cached;
+	}
+
+	$token = bv_instagram_get_token();
+	if ( empty( $token ) ) {
+		set_transient( 'bv_ig_last_error', 'no_token', 5 * MINUTE_IN_SECONDS );
+		return array();
+	}
+
+	$ig_user_id = bv_instagram_get_ig_user_id( $token );
+	if ( empty( $ig_user_id ) ) {
+		set_transient( 'bv_ig_last_error', 'no_ig_user_id', 5 * MINUTE_IN_SECONDS );
+		return array();
+	}
+
+	$endpoint = add_query_arg(
+		array(
+			'fields'       => 'id,caption,media_url,permalink,thumbnail_url,media_type,timestamp',
+			'access_token' => $token,
+			'limit'        => $limit * 2,
+		),
+		'https://graph.facebook.com/v24.0/' . rawurlencode( $ig_user_id ) . '/media'
+	);
+
+	$response = wp_remote_get( $endpoint, array( 'timeout' => 8 ) );
+	if ( is_wp_error( $response ) ) {
+		set_transient( 'bv_ig_last_error', 'media_request_error', 5 * MINUTE_IN_SECONDS );
+		return array();
+	}
+
+	$code = wp_remote_retrieve_response_code( $response );
+	if ( $code < 200 || $code >= 300 ) {
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		$msg  = is_array( $body ) && ! empty( $body['error']['message'] ) ? $body['error']['message'] : 'media_api_' . $code;
+		set_transient( 'bv_ig_last_error', $msg, 5 * MINUTE_IN_SECONDS );
+		return array();
+	}
+
+	$body = json_decode( wp_remote_retrieve_body( $response ), true );
+	if ( ! is_array( $body ) || empty( $body['data'] ) ) {
+		set_transient( 'bv_ig_last_error', 'no_media_data', 5 * MINUTE_IN_SECONDS );
+		return array();
+	}
+
+	$items = array();
+	foreach ( $body['data'] as $item ) {
+		$type = isset( $item['media_type'] ) ? $item['media_type'] : '';
+		if ( $type === 'VIDEO' ) {
+			if ( empty( $item['thumbnail_url'] ) ) {
+				continue;
+			}
+			$image_url = $item['thumbnail_url'];
+		} else {
+			$image_url = isset( $item['media_url'] ) ? $item['media_url'] : '';
+		}
+		if ( empty( $image_url ) || empty( $item['permalink'] ) ) {
+			continue;
+		}
+		$items[] = array(
+			'url'   => esc_url_raw( $image_url ),
+			'link'  => esc_url_raw( $item['permalink'] ),
+			'alt'   => isset( $item['caption'] ) ? wp_strip_all_tags( $item['caption'] ) : 'Instagram photo',
+			'time'  => isset( $item['timestamp'] ) ? $item['timestamp'] : '',
+			'type'  => $type,
+		);
+		if ( count( $items ) >= $limit ) {
+			break;
+		}
+	}
+
+	$ttl = (int) apply_filters( 'bv_instagram_media_cache_seconds', 30 * MINUTE_IN_SECONDS );
+	set_transient( $cache_key, $items, $ttl > 0 ? $ttl : 30 * MINUTE_IN_SECONDS );
+	delete_transient( 'bv_ig_last_error' );
+	return $items;
+}
+
+function bv_instagram_grid_shortcode( $atts = array() ) {
+	$atts = shortcode_atts(
+		array(
+			'limit' => 12,
+			'cols'  => 4,
+		),
+		$atts,
+		'bv_instagram_grid'
+	);
+
+	$limit = max( 1, min( 20, (int) $atts['limit'] ) );
+	$cols  = max( 2, min( 6, (int) $atts['cols'] ) );
+	$items = bv_instagram_fetch_media( $limit );
+
+	if ( empty( $items ) ) {
+		$reason = get_transient( 'bv_ig_last_error' ) ?: 'no items';
+		return '<!-- Instagram feed: ' . esc_attr( $reason ) . ' -->';
+	}
+
+	ob_start();
+	?>
+	<style>
+		.bv-ig-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+			gap: 8px;
+		}
+		@media (min-width: 900px) {
+			.bv-ig-grid { grid-template-columns: repeat(<?php echo (int) $cols; ?>, 1fr); }
+		}
+		.bv-ig-grid a {
+			position: relative;
+			display: block;
+			overflow: hidden;
+			border-radius: 4px;
+			background: #f2f2f2;
+		}
+		.bv-ig-grid img {
+			width: 100%;
+			height: 100%;
+			object-fit: cover;
+			display: block;
+		}
+	</style>
+	<div class="bv-ig-grid" aria-label="Instagram feed">
+		<?php foreach ( $items as $item ) : ?>
+			<a href="<?php echo esc_url( $item['link'] ); ?>" target="_blank" rel="noopener nofollow">
+				<img src="<?php echo esc_url( $item['url'] ); ?>"
+				     alt="<?php echo esc_attr( mb_substr( $item['alt'], 0, 140 ) ); ?>"
+				     loading="lazy"
+				     decoding="async"
+				/>
+			</a>
+		<?php endforeach; ?>
+	</div>
+	<?php
+	return ob_get_clean();
+}
+add_shortcode( 'bv_instagram_grid', 'bv_instagram_grid_shortcode' );
+
+// Verify endpoint: /wp-json/bv/v1/instagram-verify
+function bv_register_instagram_verify_route_plugin() {
+	register_rest_route( 'bv/v1', '/instagram-verify', array(
+		'methods'             => 'GET',
+		'permission_callback' => function () {
+			if ( current_user_can( 'manage_options' ) ) {
+				return true;
+			}
+			$host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( $_SERVER['HTTP_HOST'] ) : '';
+			$local_host = ( strpos( $host, 'localhost' ) !== false || strpos( $host, '127.0.0.1' ) !== false || strpos( $host, '.local' ) !== false || strpos( $host, '.test' ) !== false );
+			if ( $local_host ) {
+				return true;
+			}
+			if ( defined( 'BV_LOCAL_DEV' ) && BV_LOCAL_DEV ) {
+				return true;
+			}
+			return false;
+		},
+		'callback'            => 'bv_instagram_verify_callback_plugin',
+	) );
+}
+add_action( 'rest_api_init', 'bv_register_instagram_verify_route_plugin' );
+
+function bv_instagram_verify_callback_plugin() {
+	delete_transient( 'bv_ig_user_id' );
+	delete_transient( 'bv_ig_media_12' );
+
+	$token = bv_instagram_get_token();
+	if ( empty( $token ) ) {
+		return new WP_REST_Response( array(
+			'ok'       => false,
+			'step'     => 'token',
+			'message'  => 'No token. Set it in Settings → BV Instagram Feed.',
+		), 200 );
+	}
+
+	$ig_user_id = bv_instagram_get_ig_user_id( $token );
+	if ( empty( $ig_user_id ) ) {
+		return new WP_REST_Response( array(
+			'ok'       => false,
+			'step'     => 'ig_user_id',
+			'message'  => 'Could not resolve Instagram user id. Set it in Settings → BV Instagram Feed or ensure pages_show_list is granted.',
+		), 200 );
+	}
+
+	$items = bv_instagram_fetch_media( 12 );
+	if ( empty( $items ) ) {
+		$reason = get_transient( 'bv_ig_last_error' ) ?: 'no media returned';
+		return new WP_REST_Response( array(
+			'ok'       => false,
+			'step'     => 'media',
+			'message'  => $reason,
+			'ig_user_id' => $ig_user_id,
+		), 200 );
+	}
+
+	return new WP_REST_Response( array(
+		'ok'          => true,
+		'ig_user_id'  => $ig_user_id,
+		'media_count' => count( $items ),
+	), 200 );
+}
+
+// Auto-refresh long-lived token stored in option bv_ig_token.
+function bv_instagram_refresh_token_option() {
+	$token = get_option( BV_IG_OPTION_TOKEN );
+	if ( empty( $token ) ) {
+		return;
+	}
+
+	$url = add_query_arg(
+		array(
+			'grant_type'   => 'ig_refresh_token',
+			'access_token' => $token,
+		),
+		'https://graph.instagram.com/refresh_access_token'
+	);
+
+	$response = wp_remote_get( $url, array( 'timeout' => 15 ) );
+	if ( is_wp_error( $response ) ) {
+		return;
+	}
+
+	$code = wp_remote_retrieve_response_code( $response );
+	if ( $code < 200 || $code >= 300 ) {
+		return;
+	}
+
+	$body = json_decode( wp_remote_retrieve_body( $response ), true );
+	if ( empty( $body['access_token'] ) ) {
+		return;
+	}
+
+	update_option( BV_IG_OPTION_TOKEN, sanitize_text_field( $body['access_token'] ) );
+}
+add_action( 'bv_instagram_refresh_token', 'bv_instagram_refresh_token_option' );
+
+function bv_instagram_schedule_refresh_plugin() {
+	if ( ! wp_next_scheduled( 'bv_instagram_refresh_token' ) ) {
+		wp_schedule_event( time() + DAY_IN_SECONDS, 'daily', 'bv_instagram_refresh_token' );
+	}
+}
+add_action( 'init', 'bv_instagram_schedule_refresh_plugin' );
+
+// Admin settings page.
+function bv_instagram_settings_menu() {
+	add_options_page(
+		'BV Instagram Feed',
+		'BV Instagram Feed',
+		'manage_options',
+		'bv-instagram-feed',
+		'bv_instagram_settings_page'
+	);
+}
+add_action( 'admin_menu', 'bv_instagram_settings_menu' );
+
+function bv_instagram_settings_page() {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+
+	if ( isset( $_POST['bv_ig_settings_nonce'] ) && wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['bv_ig_settings_nonce'] ) ), 'bv_ig_settings_save' ) ) {
+		$token = isset( $_POST['bv_ig_token'] ) ? trim( (string) wp_unslash( $_POST['bv_ig_token'] ) ) : '';
+		$ig_id = isset( $_POST['bv_ig_user_id'] ) ? preg_replace( '/\D/', '', (string) wp_unslash( $_POST['bv_ig_user_id'] ) ) : '';
+		if ( $token !== '' ) {
+			update_option( BV_IG_OPTION_TOKEN, $token );
+		}
+		update_option( BV_IG_OPTION_IG_ID, $ig_id );
+		echo '<div class="updated"><p>Settings saved.</p></div>';
+	}
+
+	$token = get_option( BV_IG_OPTION_TOKEN, '' );
+	$ig_id = esc_attr( get_option( BV_IG_OPTION_IG_ID, '' ) );
+	$token_placeholder = $token !== '' ? '••••••••' : '';
+	?>
+	<div class="wrap">
+		<h1>BV Instagram Feed</h1>
+		<form method="post">
+			<?php wp_nonce_field( 'bv_ig_settings_save', 'bv_ig_settings_nonce' ); ?>
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row"><label for="bv_ig_token">Access token</label></th>
+					<td>
+						<input type="password" id="bv_ig_token" name="bv_ig_token" class="regular-text" value="" placeholder="<?php echo esc_attr( $token_placeholder ); ?>" autocomplete="off" />
+						<p class="description">Long-lived token (auto-refreshed daily). Leave blank to keep current. Constants BV_IG_TOKEN / BV_IG_USER_ID override when set.</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="bv_ig_user_id">Instagram Business Account ID</label></th>
+					<td>
+						<input type="text" id="bv_ig_user_id" name="bv_ig_user_id" class="regular-text" value="<?php echo $ig_id; ?>" placeholder="e.g. 17841401718325671" />
+						<p class="description">Numeric ID from Meta app → Instagram API setup.</p>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button(); ?>
+		</form>
+	</div>
+	<?php
+}
