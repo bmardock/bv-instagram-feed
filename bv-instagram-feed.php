@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Config: Settings → BV Instagram Feed, or constants BV_IG_TOKEN, BV_IG_USER_ID.
- * Shortcode: [bv_instagram_grid limit="12" cols="4" size="m"] — size: t (150px), m (306px), l (640px), full.
+ * Shortcode: [bv_instagram_grid limit="12" cols="4" size="full"] — size: full (default, API CDN), t (150px), m (306px), l (640px). t/m/l use a public URL that may not work when hotlinked (e.g. on live).
  * Verify: GET /wp-json/bv/v1/instagram-verify
  * Filter: bv_instagram_media_cache_seconds (default 30 min) to tune media cache TTL.
  *
@@ -141,9 +141,9 @@ function bv_instagram_image_url_for_display( $media_url, $permalink, $media_type
 	return 'https://www.instagram.com/p/' . $shortcode . '/media/?size=' . $size;
 }
 
-function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
+function bv_instagram_fetch_media( $limit = 12, $size = 'full' ) {
 	$limit = max( 1, min( 20, (int) $limit ) );
-	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
+	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'full';
 	$cache_key = 'bv_ig_media_' . $limit . '_' . $size;
 	$cached = get_transient( $cache_key );
 	if ( $cached !== false ) {
@@ -229,7 +229,7 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 		array(
 			'limit' => 12,
 			'cols'  => 4,
-			'size'  => 'm',
+			'size'  => 'full',
 		),
 		$atts,
 		'bv_instagram_grid'
@@ -237,7 +237,7 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 
 	$limit = max( 1, min( 20, (int) $atts['limit'] ) );
 	$cols  = max( 2, min( 6, (int) $atts['cols'] ) );
-	$size  = in_array( $atts['size'], array( 't', 'm', 'l', 'full' ), true ) ? $atts['size'] : 'm';
+	$size  = in_array( $atts['size'], array( 't', 'm', 'l', 'full' ), true ) ? $atts['size'] : 'full';
 	$items = bv_instagram_fetch_media( $limit, $size );
 
 	if ( empty( $items ) ) {
@@ -311,7 +311,7 @@ add_action( 'rest_api_init', 'bv_register_instagram_verify_route_plugin' );
 
 function bv_instagram_verify_callback_plugin() {
 	delete_transient( 'bv_ig_user_id' );
-	delete_transient( 'bv_ig_media_12_m' );
+	delete_transient( 'bv_ig_media_12_full' );
 
 	$token = bv_instagram_get_token();
 	if ( empty( $token ) ) {
