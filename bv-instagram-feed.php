@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 /**
  * Config: Settings → BV Instagram Feed, or constants BV_IG_TOKEN, BV_IG_USER_ID.
- * Shortcode: [bv_instagram_grid limit="12" cols="4"]
+ * Shortcode: [bv_instagram_grid limit="12" cols="4" size="m"] — size: t (150px), m (306px), l (640px), full.
  * Verify: GET /wp-json/bv/v1/instagram-verify
  * Filter: bv_instagram_media_cache_seconds (default 30 min) to tune media cache TTL.
  *
@@ -98,9 +98,53 @@ function bv_instagram_get_ig_user_id( $token ) {
 	return $ig_user_id;
 }
 
-function bv_instagram_fetch_media( $limit = 12 ) {
+/**
+ * Extract Instagram post shortcode from permalink (e.g. https://www.instagram.com/p/ABC123/ -> ABC123).
+ * Used to build smaller image URLs via the public media endpoint.
+ *
+ * @param string $permalink Permalink URL.
+ * @return string|null Shortcode or null.
+ */
+function bv_instagram_shortcode_from_permalink( $permalink ) {
+	if ( ! is_string( $permalink ) || $permalink === '' ) {
+		return null;
+	}
+	if ( preg_match( '#/p/([A-Za-z0-9_-]+)/?#', $permalink, $m ) ) {
+		return $m[1];
+	}
+	return null;
+}
+
+/**
+ * Build a smaller image URL using Instagram's public media endpoint when possible.
+ * Graph API returns full-size media_url; this uses /p/{shortcode}/media/?size=x (t=150, m=306, l=640).
+ *
+ * @param string $media_url  Full media_url from API.
+ * @param string $permalink  Post permalink.
+ * @param string $media_type IMAGE, VIDEO, etc.
+ * @param string $size       't'|'m'|'l'|'full'. 'full' = use media_url as-is.
+ * @return string URL to use for img src.
+ */
+function bv_instagram_image_url_for_display( $media_url, $permalink, $media_type, $size = 'm' ) {
+	if ( $size === 'full' || empty( $permalink ) ) {
+		return $media_url;
+	}
+	$shortcode = bv_instagram_shortcode_from_permalink( $permalink );
+	if ( $shortcode === null ) {
+		return $media_url;
+	}
+	// Public endpoint: t=150, m=306, l=640. Only use for IMAGE/CAROUSEL; VIDEO we keep thumbnail_url.
+	if ( $media_type !== 'IMAGE' && $media_type !== 'CAROUSEL_ALBUM' ) {
+		return $media_url;
+	}
+	$size = in_array( $size, array( 't', 'm', 'l' ), true ) ? $size : 'm';
+	return 'https://www.instagram.com/p/' . $shortcode . '/media/?size=' . $size;
+}
+
+function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$limit = max( 1, min( 20, (int) $limit ) );
-	$cache_key = 'bv_ig_media_' . $limit;
+	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
+	$cache_key = 'bv_ig_media_' . $limit . '_' . $size;
 	$cached = get_transient( $cache_key );
 	if ( $cached !== false ) {
 		return $cached;
@@ -161,6 +205,7 @@ function bv_instagram_fetch_media( $limit = 12 ) {
 		if ( empty( $image_url ) || empty( $item['permalink'] ) ) {
 			continue;
 		}
+		$image_url = bv_instagram_image_url_for_display( $image_url, $item['permalink'], $type, $size );
 		$items[] = array(
 			'url'   => esc_url_raw( $image_url ),
 			'link'  => esc_url_raw( $item['permalink'] ),
@@ -184,6 +229,7 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 		array(
 			'limit' => 12,
 			'cols'  => 4,
+			'size'  => 'm',
 		),
 		$atts,
 		'bv_instagram_grid'
@@ -191,7 +237,8 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 
 	$limit = max( 1, min( 20, (int) $atts['limit'] ) );
 	$cols  = max( 2, min( 6, (int) $atts['cols'] ) );
-	$items = bv_instagram_fetch_media( $limit );
+	$size  = in_array( $atts['size'], array( 't', 'm', 'l', 'full' ), true ) ? $atts['size'] : 'm';
+	$items = bv_instagram_fetch_media( $limit, $size );
 
 	if ( empty( $items ) ) {
 		$reason = get_transient( 'bv_ig_last_error' ) ?: 'no items';
@@ -264,7 +311,7 @@ add_action( 'rest_api_init', 'bv_register_instagram_verify_route_plugin' );
 
 function bv_instagram_verify_callback_plugin() {
 	delete_transient( 'bv_ig_user_id' );
-	delete_transient( 'bv_ig_media_12' );
+	delete_transient( 'bv_ig_media_12_m' );
 
 	$token = bv_instagram_get_token();
 	if ( empty( $token ) ) {
