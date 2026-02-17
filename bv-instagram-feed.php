@@ -130,9 +130,11 @@ function bv_instagram_proxy_url( $image_url, $size = 'm' ) {
 		return '';
 	}
 	$size = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
+	// URL-safe base64 so + and / in query string don't get mangled (e.g. + → space).
+	$url_b64 = strtr( base64_encode( $image_url ), '+/', '-_' );
 	return add_query_arg(
 		array(
-			'bv_ig_url'  => base64_encode( $image_url ),
+			'bv_ig_url'  => $url_b64,
 			'bv_ig_sig'  => hash_hmac( 'sha256', $image_url, AUTH_KEY ),
 			'bv_ig_size' => $size,
 		),

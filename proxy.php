@@ -20,6 +20,9 @@ $max_dim = array( 't' => 150, 'm' => 306, 'l' => 640, 'full' => 1080 );
 $max_dim = isset( $max_dim[ $size ] ) ? $max_dim[ $size ] : 306;
 $want_webp = ! empty( $_SERVER['HTTP_ACCEPT'] ) && stripos( $_SERVER['HTTP_ACCEPT'], 'image/webp' ) !== false && function_exists( 'imagewebp' );
 
+// URL-safe base64: restore +/ from -_ (plugin sends -_), and fix + if CDN/server turned it into space.
+$url_b64 = str_replace( ' ', '+', $url_b64 );
+$url_b64 = strtr( $url_b64, '-_', '+/' );
 $image_url = @base64_decode( $url_b64, true );
 if ( $image_url === false || $image_url === '' || ! preg_match( '#^https?://([a-z0-9.-]+\.(cdninstagram\.com|fbcdn\.net|instagram\.com))/#i', $image_url ) ) {
 	header( 'HTTP/1.1 400 Bad Request' );
