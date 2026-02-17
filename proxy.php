@@ -18,7 +18,6 @@ if ( ! in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ) {
 
 $max_dim = array( 't' => 150, 'm' => 306, 'l' => 640, 'full' => 1080 );
 $max_dim = isset( $max_dim[ $size ] ) ? $max_dim[ $size ] : 306;
-$want_webp = ! empty( $_SERVER['HTTP_ACCEPT'] ) && stripos( $_SERVER['HTTP_ACCEPT'], 'image/webp' ) !== false && function_exists( 'imagewebp' );
 
 // URL-safe base64: restore +/ from -_, fix + if mangled, restore padding so decode is correct.
 $url_b64 = str_replace( ' ', '+', $url_b64 );
@@ -126,7 +125,7 @@ if ( $max_dim > 0 && function_exists( 'imagecreatefromstring' ) && function_exis
 			}
 		}
 		ob_start();
-		if ( $want_webp && function_exists( 'imagewebp' ) ) {
+		if ( function_exists( 'imagewebp' ) ) {
 			@imagewebp( $img, null, 82 );
 		} else {
 			@imagejpeg( $img, null, 82 );
@@ -134,7 +133,7 @@ if ( $max_dim > 0 && function_exists( 'imagecreatefromstring' ) && function_exis
 		$out_body = ob_get_clean();
 		if ( $out_body !== '' ) {
 			$body = $out_body;
-			$ct = ( $want_webp && function_exists( 'imagewebp' ) ) ? 'image/webp' : 'image/jpeg';
+			$ct = function_exists( 'imagewebp' ) ? 'image/webp' : 'image/jpeg';
 		}
 		imagedestroy( $img );
 	}
