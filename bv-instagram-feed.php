@@ -130,8 +130,8 @@ function bv_instagram_proxy_url( $image_url, $size = 'm' ) {
 		return '';
 	}
 	$size = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
-	// URL-safe base64 so + and / in query string don't get mangled (e.g. + → space).
-	$url_b64 = strtr( base64_encode( $image_url ), '+/', '-_' );
+	// URL-safe base64; strip padding so = in query string doesn't break parsing (e.g. 12th image).
+	$url_b64 = rtrim( strtr( base64_encode( $image_url ), '+/', '-_' ), '=' );
 	return add_query_arg(
 		array(
 			'bv_ig_url'  => $url_b64,
@@ -167,7 +167,7 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 		array(
 			'fields'       => 'id,caption,media_url,permalink,thumbnail_url,media_type,timestamp',
 			'access_token' => $token,
-			'limit'        => $limit * 2,
+			'limit'        => $limit * 3,
 		),
 		'https://graph.facebook.com/v24.0/' . rawurlencode( $ig_user_id ) . '/media'
 	);
