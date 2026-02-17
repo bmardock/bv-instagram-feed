@@ -2,7 +2,7 @@
 /*
 Plugin Name: BV Instagram Feed
 Description: Lightweight Instagram grid + token refresh for Boardwalk Vintage.
-Version: 0.1.0
+Version: 0.2.0
 Author: Boardwalk Vintage
 */
 
@@ -11,18 +11,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Config: Settings → BV Instagram Feed, or constants BV_IG_TOKEN, BV_IG_USER_ID.
- * Shortcode: [bv_instagram_grid limit="12" cols="4" size="full"] — size: full (default, API CDN), t (150px), m (306px), l (640px). t/m/l use a public URL that may not work when hotlinked (e.g. on live).
- * Verify: GET /wp-json/bv/v1/instagram-verify
- * Filter: bv_instagram_media_cache_seconds (default 30 min) to tune media cache TTL.
- *
- * Rate limits (Meta app-level): 200 × number of users per hour. We use: media (cached),
- * ig user id (cached 24h), token refresh (1×/day). Increase cache TTL on high-traffic sites.
+ * BV Instagram Feed. Settings → BV Instagram Feed for token + IG user ID.
+ * Shortcode: [bv_instagram_grid limit="12" cols="4" size="m"] — images via proxy.php (same-origin).
+ * Verify: GET /wp-json/bv/v1/instagram-verify | Filter: bv_instagram_media_cache_seconds
  */
 
 // Option names.
-const BV_IG_OPTION_TOKEN  = 'bv_ig_token';
-const BV_IG_OPTION_IG_ID  = 'bv_ig_user_id';
+const BV_IG_OPTION_TOKEN   = 'bv_ig_token';
+const BV_IG_OPTION_IG_ID   = 'bv_ig_user_id';
+const BV_IG_OPTION_CDN_URL = 'bv_ig_cdn_url';
 
 /**
  * Get current token.
@@ -99,51 +96,53 @@ function bv_instagram_get_ig_user_id( $token ) {
 }
 
 /**
- * Extract Instagram post shortcode from permalink (e.g. https://www.instagram.com/p/ABC123/ -> ABC123).
- * Used to build smaller image URLs via the public media endpoint.
+ * Base URL for proxy.php. Uses CDN when configured (constant BV_IG_CDN_URL or option bv_ig_cdn_url).
  *
- * @param string $permalink Permalink URL.
- * @return string|null Shortcode or null.
+ * @return string Full URL to proxy.php (no query args).
  */
-function bv_instagram_shortcode_from_permalink( $permalink ) {
-	if ( ! is_string( $permalink ) || $permalink === '' ) {
-		return null;
+function bv_instagram_proxy_base_url() {
+	$fallback = set_url_scheme( plugins_url( 'proxy.php', __FILE__ ), is_ssl() ? 'https' : 'http' );
+	$cdn = '';
+	if ( defined( 'BV_IG_CDN_URL' ) && BV_IG_CDN_URL !== '' ) {
+		$cdn = BV_IG_CDN_URL;
+	} else {
+		$saved = get_option( BV_IG_OPTION_CDN_URL, '' );
+		if ( is_string( $saved ) && trim( $saved ) !== '' ) {
+			$cdn = trim( $saved );
+		}
 	}
-	if ( preg_match( '#/p/([A-Za-z0-9_-]+)/?#', $permalink, $m ) ) {
-		return $m[1];
+	if ( $cdn === '' ) {
+		return $fallback;
 	}
-	return null;
+	$path = wp_parse_url( $fallback, PHP_URL_PATH );
+	return rtrim( $cdn, '/' ) . ( $path !== null && $path !== '' ? $path : '/wp-content/plugins/bv-instagram-feed/proxy.php' );
 }
 
 /**
- * Build a smaller image URL using Instagram's public media endpoint when possible.
- * Graph API returns full-size media_url; this uses /p/{shortcode}/media/?size=x (t=150, m=306, l=640).
+ * Build signed proxy URL for an image (no DB in proxy; shortcode passes URL + HMAC with AUTH_KEY).
  *
- * @param string $media_url  Full media_url from API.
- * @param string $permalink  Post permalink.
- * @param string $media_type IMAGE, VIDEO, etc.
- * @param string $size       't'|'m'|'l'|'full'. 'full' = use media_url as-is.
- * @return string URL to use for img src.
+ * @param string $image_url Instagram CDN URL from API.
+ * @param string $size      t|m|l|full.
+ * @return string Full proxy.php URL or empty if AUTH_KEY missing.
  */
-function bv_instagram_image_url_for_display( $media_url, $permalink, $media_type, $size = 'm' ) {
-	if ( $size === 'full' || empty( $permalink ) ) {
-		return $media_url;
+function bv_instagram_proxy_url( $image_url, $size = 'm' ) {
+	if ( ! defined( 'AUTH_KEY' ) || AUTH_KEY === '' || $image_url === '' ) {
+		return '';
 	}
-	$shortcode = bv_instagram_shortcode_from_permalink( $permalink );
-	if ( $shortcode === null ) {
-		return $media_url;
-	}
-	// Public endpoint: t=150, m=306, l=640. Only use for IMAGE/CAROUSEL; VIDEO we keep thumbnail_url.
-	if ( $media_type !== 'IMAGE' && $media_type !== 'CAROUSEL_ALBUM' ) {
-		return $media_url;
-	}
-	$size = in_array( $size, array( 't', 'm', 'l' ), true ) ? $size : 'm';
-	return 'https://www.instagram.com/p/' . $shortcode . '/media/?size=' . $size;
+	$size = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
+	return add_query_arg(
+		array(
+			'bv_ig_url'  => base64_encode( $image_url ),
+			'bv_ig_sig'  => hash_hmac( 'sha256', $image_url, AUTH_KEY ),
+			'bv_ig_size' => $size,
+		),
+		bv_instagram_proxy_base_url()
+	);
 }
 
-function bv_instagram_fetch_media( $limit = 12, $size = 'full' ) {
+function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$limit = max( 1, min( 20, (int) $limit ) );
-	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'full';
+	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
 	$cache_key = 'bv_ig_media_' . $limit . '_' . $size;
 	$cached = get_transient( $cache_key );
 	if ( $cached !== false ) {
@@ -205,7 +204,7 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'full' ) {
 		if ( empty( $image_url ) || empty( $item['permalink'] ) ) {
 			continue;
 		}
-		$image_url = bv_instagram_image_url_for_display( $image_url, $item['permalink'], $type, $size );
+		// Store API CDN URL so the proxy can fetch it (server-side). Public instagram.com/p/.../media URLs often block server requests.
 		$items[] = array(
 			'url'   => esc_url_raw( $image_url ),
 			'link'  => esc_url_raw( $item['permalink'] ),
@@ -229,7 +228,7 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 		array(
 			'limit' => 12,
 			'cols'  => 4,
-			'size'  => 'full',
+			'size'  => 'm',
 		),
 		$atts,
 		'bv_instagram_grid'
@@ -237,7 +236,7 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 
 	$limit = max( 1, min( 20, (int) $atts['limit'] ) );
 	$cols  = max( 2, min( 6, (int) $atts['cols'] ) );
-	$size  = in_array( $atts['size'], array( 't', 'm', 'l', 'full' ), true ) ? $atts['size'] : 'full';
+	$size  = in_array( $atts['size'], array( 't', 'm', 'l', 'full' ), true ) ? $atts['size'] : 'm';
 	$items = bv_instagram_fetch_media( $limit, $size );
 
 	if ( empty( $items ) ) {
@@ -271,9 +270,15 @@ function bv_instagram_grid_shortcode( $atts = array() ) {
 		}
 	</style>
 	<div class="bv-ig-grid" aria-label="Instagram feed">
-		<?php foreach ( $items as $item ) : ?>
+		<?php
+		foreach ( $items as $i => $item ) :
+			$img_src = bv_instagram_proxy_url( $item['url'], $size );
+			if ( $img_src === '' ) {
+				$img_src = $item['url'];
+			}
+		?>
 			<a href="<?php echo esc_url( $item['link'] ); ?>" target="_blank" rel="noopener nofollow">
-				<img src="<?php echo esc_url( $item['url'] ); ?>"
+				<img src="<?php echo esc_url( $img_src ); ?>"
 				     alt="<?php echo esc_attr( mb_substr( $item['alt'], 0, 140 ) ); ?>"
 				     loading="lazy"
 				     decoding="async"
@@ -311,7 +316,6 @@ add_action( 'rest_api_init', 'bv_register_instagram_verify_route_plugin' );
 
 function bv_instagram_verify_callback_plugin() {
 	delete_transient( 'bv_ig_user_id' );
-	delete_transient( 'bv_ig_media_12_full' );
 
 	$token = bv_instagram_get_token();
 	if ( empty( $token ) ) {
@@ -331,22 +335,25 @@ function bv_instagram_verify_callback_plugin() {
 		), 200 );
 	}
 
-	$items = bv_instagram_fetch_media( 12 );
+	$items = bv_instagram_fetch_media( 12, 'm' );
 	if ( empty( $items ) ) {
 		$reason = get_transient( 'bv_ig_last_error' ) ?: 'no media returned';
 		return new WP_REST_Response( array(
-			'ok'       => false,
-			'step'     => 'media',
-			'message'  => $reason,
+			'ok'         => false,
+			'step'       => 'media',
+			'message'    => $reason,
 			'ig_user_id' => $ig_user_id,
 		), 200 );
 	}
 
-	return new WP_REST_Response( array(
-		'ok'          => true,
-		'ig_user_id'  => $ig_user_id,
-		'media_count' => count( $items ),
-	), 200 );
+	$test_url = isset( $items[0]['url'] ) ? bv_instagram_proxy_url( $items[0]['url'], 'm' ) : '';
+	$data = array(
+		'ok'              => true,
+		'ig_user_id'      => $ig_user_id,
+		'media_count'     => count( $items ),
+		'test_image_url'  => $test_url,
+	);
+	return new WP_REST_Response( $data, 200 );
 }
 
 // Auto-refresh long-lived token stored in option bv_ig_token.
@@ -408,17 +415,18 @@ function bv_instagram_settings_page() {
 	}
 
 	if ( isset( $_POST['bv_ig_settings_nonce'] ) && wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['bv_ig_settings_nonce'] ) ), 'bv_ig_settings_save' ) ) {
-		$token = isset( $_POST['bv_ig_token'] ) ? trim( (string) wp_unslash( $_POST['bv_ig_token'] ) ) : '';
-		$ig_id = isset( $_POST['bv_ig_user_id'] ) ? preg_replace( '/\D/', '', (string) wp_unslash( $_POST['bv_ig_user_id'] ) ) : '';
-		if ( $token !== '' ) {
-			update_option( BV_IG_OPTION_TOKEN, $token );
-		}
+		$token  = isset( $_POST['bv_ig_token'] ) ? trim( (string) wp_unslash( $_POST['bv_ig_token'] ) ) : '';
+		$ig_id  = isset( $_POST['bv_ig_user_id'] ) ? preg_replace( '/\D/', '', (string) wp_unslash( $_POST['bv_ig_user_id'] ) ) : '';
+		$cdn_url = isset( $_POST['bv_ig_cdn_url'] ) ? trim( esc_url_raw( wp_unslash( $_POST['bv_ig_cdn_url'] ) ) ) : '';
+		update_option( BV_IG_OPTION_TOKEN, $token );
 		update_option( BV_IG_OPTION_IG_ID, $ig_id );
+		update_option( BV_IG_OPTION_CDN_URL, $cdn_url );
 		echo '<div class="updated"><p>Settings saved.</p></div>';
 	}
 
 	$token = get_option( BV_IG_OPTION_TOKEN, '' );
-	$ig_id = esc_attr( get_option( BV_IG_OPTION_IG_ID, '' ) );
+	$ig_id = get_option( BV_IG_OPTION_IG_ID, '' );
+	$cdn_url = get_option( BV_IG_OPTION_CDN_URL, '' );
 	$token_placeholder = $token !== '' ? '••••••••' : '';
 	?>
 	<div class="wrap">
@@ -430,14 +438,21 @@ function bv_instagram_settings_page() {
 					<th scope="row"><label for="bv_ig_token">Access token</label></th>
 					<td>
 						<input type="password" id="bv_ig_token" name="bv_ig_token" class="regular-text" value="" placeholder="<?php echo esc_attr( $token_placeholder ); ?>" autocomplete="off" />
-						<p class="description">Long-lived token (auto-refreshed daily). Leave blank to keep current. Constants BV_IG_TOKEN / BV_IG_USER_ID override when set.</p>
+						<p class="description">Long-lived token (auto-refreshed daily). Leave blank to clear. Constants BV_IG_TOKEN / BV_IG_USER_ID override when set.</p>
 					</td>
 				</tr>
 				<tr>
 					<th scope="row"><label for="bv_ig_user_id">Instagram Business Account ID</label></th>
 					<td>
-						<input type="text" id="bv_ig_user_id" name="bv_ig_user_id" class="regular-text" value="<?php echo $ig_id; ?>" placeholder="e.g. 17841401718325671" />
+						<input type="text" id="bv_ig_user_id" name="bv_ig_user_id" class="regular-text" value="<?php echo esc_attr( $ig_id ); ?>" placeholder="e.g. 17841401718325671" />
 						<p class="description">Numeric ID from Meta app → Instagram API setup.</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="bv_ig_cdn_url">CDN URL (proxy)</label></th>
+					<td>
+						<input type="url" id="bv_ig_cdn_url" name="bv_ig_cdn_url" class="regular-text" value="<?php echo esc_attr( $cdn_url ); ?>" placeholder="https://cdn.example.com" />
+						<p class="description">When set, image proxy URLs use this origin (e.g. <code>https://cdn.example.com</code>). Leave blank to use the current site. Constant <code>BV_IG_CDN_URL</code> overrides when set.</p>
 					</td>
 				</tr>
 			</table>
