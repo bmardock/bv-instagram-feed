@@ -2,7 +2,7 @@
 /*
 Plugin Name: BV Instagram Feed
 Description: Lightweight Instagram grid + token refresh for Boardwalk Vintage.
-Version: 0.3.0
+Version: 0.3.1
 Author: Boardwalk Vintage
 */
 
@@ -204,7 +204,7 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 
 	$endpoint = add_query_arg(
 		array(
-			'fields'       => 'id,caption,media_url,permalink,thumbnail_url,media_type,timestamp',
+			'fields'       => 'id,caption,media_url,permalink,thumbnail_url,media_type,media_product_type,timestamp',
 			'access_token' => $token,
 			'limit'        => $limit * 3,
 		),
@@ -237,8 +237,15 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 		return array();
 	}
 
+	// Feed posts only: /media also returns Reels (media_product_type REELS),
+	// which aren't what the grid is for. Filter to change it, e.g. add 'REELS'.
+	$product_types = (array) apply_filters( 'bv_instagram_media_product_types', array( 'FEED' ) );
+
 	$items = array();
 	foreach ( $body['data'] as $item ) {
+		if ( ! empty( $item['media_product_type'] ) && ! in_array( $item['media_product_type'], $product_types, true ) ) {
+			continue;
+		}
 		$type = isset( $item['media_type'] ) ? $item['media_type'] : '';
 		if ( $type === 'VIDEO' ) {
 			if ( empty( $item['thumbnail_url'] ) ) {
