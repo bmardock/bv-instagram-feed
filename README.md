@@ -19,7 +19,8 @@ if ( file_exists( $bv_ig ) ) {
 ## Setup
 
 - **Token & IG ID:** Settings → BV Instagram Feed, or set constants `BV_IG_TOKEN` and `BV_IG_USER_ID` (e.g. in wp-config or a loaded file). Constants override saved options.
-- **Token:** Long-lived Instagram user access token (from Meta app → Instagram API with Instagram Login). Stored token is auto-refreshed daily.
+- **Token:** use one that doesn't expire: a **system user token** from Meta Business settings → Users → System users (assign the Instagram account and its Facebook Page; permissions `instagram_basic`, `pages_show_list`, `pages_read_engagement`). Facebook Graph tokens (`EAA…`) can't be refreshed by this plugin; only Instagram Login tokens (`IG…`) are refreshed daily. A 60-day `EAA…` token expired unnoticed on 2026-04-18 because the old refresh only knew the `IG…` kind.
+- **Health:** a daily check (and every real fetch) records status in the `bv_ig_status` option. When the feed fails, the site admin gets an email (then weekly while it stays broken), the dashboard shows a warning, and Settings → BV Instagram Feed shows the status with a **Test now** button. A failure is cached for 5 minutes so the API isn't retried on every page view.
 - **IG ID:** Instagram Business Account numeric ID (from Meta app → Instagram API setup, under the connected account).
 
 ## Usage

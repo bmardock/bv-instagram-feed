@@ -6,7 +6,7 @@ Things that were improved or are worth watching.
 
 - **Proxy without DB** – Shortcode passes signed image URL; proxy only reads `wp-config` for `AUTH_KEY`. No PDO, no DB. Single responsibility, easier to reason about and deploy behind CDN.
 - **DRY** – `bv_instagram_proxy_url( $image_url, $size )` builds the signed proxy URL; shortcode and verify both use it.
-- **Settings** – Saving with an empty token field now clears the stored token (previously it was left unchanged).
+- **Settings** – The token field never shows the saved token, so an empty field now *keeps* it; clearing takes the "Clear saved token" checkbox. (Clearing on empty, as before, wiped the token whenever any other setting was saved.)
 - **Fallback** – If `AUTH_KEY` is missing, shortcode falls back to the raw Instagram URL (may fail cross-origin on some hosts; document that AUTH_KEY is required for proxy).
 
 ## Watch / optional improvements
