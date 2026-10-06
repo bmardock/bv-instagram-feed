@@ -2,7 +2,7 @@
 /*
 Plugin Name: BV Instagram Feed
 Description: Lightweight Instagram grid + token refresh for Boardwalk Vintage.
-Version: 0.2.0
+Version: 0.3.0
 Author: Boardwalk Vintage
 */
 
@@ -20,6 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 const BV_IG_OPTION_TOKEN   = 'bv_ig_token';
 const BV_IG_OPTION_IG_ID   = 'bv_ig_user_id';
 const BV_IG_OPTION_CDN_URL = 'bv_ig_cdn_url';
+const BV_IG_OPTION_STATUS  = 'bv_ig_status'; // { ok, checked, error, failing_since, notified }
 
 /**
  * Get current token.
@@ -142,6 +143,42 @@ function bv_instagram_proxy_url( $image_url, $size = 'm' ) {
 	);
 }
 
+/**
+ * Lasting record of whether the feed works, so a dead token doesn't go
+ * unnoticed: errors used to live in a 5-minute transient and the home page
+ * hides the grid when it fails (the token expired 2026-04-18 and nobody
+ * knew until October).
+ */
+function bv_instagram_record_status( $ok, $error = '' ) {
+	$prev = get_option( BV_IG_OPTION_STATUS, array() );
+	$prev = is_array( $prev ) ? $prev : array();
+	$now  = time();
+	$status = array(
+		'ok'            => (bool) $ok,
+		'checked'       => $now,
+		'error'         => $ok ? '' : (string) $error,
+		'failing_since' => $ok ? 0 : ( ! empty( $prev['failing_since'] ) ? (int) $prev['failing_since'] : $now ),
+		'notified'      => $ok ? 0 : ( isset( $prev['notified'] ) ? (int) $prev['notified'] : 0 ),
+	);
+	// Email the site admin when it starts failing, then weekly while it stays broken.
+	if ( ! $ok && ( ! $status['notified'] || $now - $status['notified'] > WEEK_IN_SECONDS ) ) {
+		$sent = wp_mail(
+			get_option( 'admin_email' ),
+			'[' . wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ) . '] Instagram feed is not loading',
+			"The Instagram grid on the home page is hidden because the feed can't load.\n\n"
+			. 'Error: ' . $status['error'] . "\n"
+			. 'Failing since: ' . gmdate( 'Y-m-d H:i', $status['failing_since'] ) . " UTC\n\n"
+			. "Fix: Settings → BV Instagram Feed (status and a Test button are there).\n"
+			. admin_url( 'options-general.php?page=bv-instagram-feed' ) . "\n"
+		);
+		if ( $sent ) {
+			$status['notified'] = $now;
+		}
+	}
+	update_option( BV_IG_OPTION_STATUS, $status, false );
+	return $status;
+}
+
 function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$limit = max( 1, min( 20, (int) $limit ) );
 	$size  = in_array( $size, array( 't', 'm', 'l', 'full' ), true ) ? $size : 'm';
@@ -154,12 +191,14 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$token = bv_instagram_get_token();
 	if ( empty( $token ) ) {
 		set_transient( 'bv_ig_last_error', 'no_token', 5 * MINUTE_IN_SECONDS );
+		bv_instagram_record_status( false, 'no_token' );
 		return array();
 	}
 
 	$ig_user_id = bv_instagram_get_ig_user_id( $token );
 	if ( empty( $ig_user_id ) ) {
 		set_transient( 'bv_ig_last_error', 'no_ig_user_id', 5 * MINUTE_IN_SECONDS );
+		bv_instagram_record_status( false, 'no_ig_user_id' );
 		return array();
 	}
 
@@ -175,6 +214,8 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$response = wp_remote_get( $endpoint, array( 'timeout' => 8 ) );
 	if ( is_wp_error( $response ) ) {
 		set_transient( 'bv_ig_last_error', 'media_request_error', 5 * MINUTE_IN_SECONDS );
+		bv_instagram_record_status( false, 'media_request_error: ' . $response->get_error_message() );
+		set_transient( $cache_key, array(), 5 * MINUTE_IN_SECONDS ); // don't retry on every page view
 		return array();
 	}
 
@@ -183,12 +224,16 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 		$msg  = is_array( $body ) && ! empty( $body['error']['message'] ) ? $body['error']['message'] : 'media_api_' . $code;
 		set_transient( 'bv_ig_last_error', $msg, 5 * MINUTE_IN_SECONDS );
+		bv_instagram_record_status( false, $msg );
+		set_transient( $cache_key, array(), 5 * MINUTE_IN_SECONDS ); // don't retry on every page view
 		return array();
 	}
 
 	$body = json_decode( wp_remote_retrieve_body( $response ), true );
 	if ( ! is_array( $body ) || empty( $body['data'] ) ) {
 		set_transient( 'bv_ig_last_error', 'no_media_data', 5 * MINUTE_IN_SECONDS );
+		bv_instagram_record_status( false, 'no_media_data' );
+		set_transient( $cache_key, array(), 5 * MINUTE_IN_SECONDS ); // don't retry on every page view
 		return array();
 	}
 
@@ -222,6 +267,7 @@ function bv_instagram_fetch_media( $limit = 12, $size = 'm' ) {
 	$ttl = (int) apply_filters( 'bv_instagram_media_cache_seconds', 30 * MINUTE_IN_SECONDS );
 	set_transient( $cache_key, $items, $ttl > 0 ? $ttl : 30 * MINUTE_IN_SECONDS );
 	delete_transient( 'bv_ig_last_error' );
+	bv_instagram_record_status( true );
 	return $items;
 }
 
@@ -358,10 +404,27 @@ function bv_instagram_verify_callback_plugin() {
 	return new WP_REST_Response( $data, 200 );
 }
 
-// Auto-refresh long-lived token stored in option bv_ig_token.
+/**
+ * Daily job: refresh an Instagram-Login token, then check the feed works.
+ *
+ * Only "IG…" tokens (Instagram API with Instagram Login) can be refreshed at
+ * graph.instagram.com. Facebook Graph tokens ("EAA…", what this site uses)
+ * can't: the old code called that endpoint for them every day, failed
+ * silently, and the 60-day token expired. Use a token that doesn't expire
+ * instead (a Business Manager system user token); the health check below
+ * emails the admin if it ever stops working.
+ */
+function bv_instagram_daily() {
+	bv_instagram_refresh_token_option();
+	foreach ( array( 'bv_ig_media_12_m' ) as $key ) {
+		delete_transient( $key ); // force a real API call for the check
+	}
+	bv_instagram_fetch_media( 12, 'm' );
+}
+
 function bv_instagram_refresh_token_option() {
 	$token = get_option( BV_IG_OPTION_TOKEN );
-	if ( empty( $token ) ) {
+	if ( empty( $token ) || 0 !== strpos( $token, 'IG' ) ) {
 		return;
 	}
 
@@ -390,7 +453,7 @@ function bv_instagram_refresh_token_option() {
 
 	update_option( BV_IG_OPTION_TOKEN, sanitize_text_field( $body['access_token'] ) );
 }
-add_action( 'bv_instagram_refresh_token', 'bv_instagram_refresh_token_option' );
+add_action( 'bv_instagram_refresh_token', 'bv_instagram_daily' );
 
 function bv_instagram_schedule_refresh_plugin() {
 	if ( ! wp_next_scheduled( 'bv_instagram_refresh_token' ) ) {
@@ -398,6 +461,24 @@ function bv_instagram_schedule_refresh_plugin() {
 	}
 }
 add_action( 'init', 'bv_instagram_schedule_refresh_plugin' );
+
+// Dashboard warning while the feed is failing (admins only).
+function bv_instagram_admin_notice() {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+	$status = get_option( BV_IG_OPTION_STATUS, array() );
+	if ( empty( $status ) || ! empty( $status['ok'] ) ) {
+		return;
+	}
+	printf(
+		'<div class="notice notice-error"><p><strong>Instagram feed is not loading</strong> (since %1$s): %2$s. <a href="%3$s">Settings → BV Instagram Feed</a></p></div>',
+		esc_html( gmdate( 'M j, Y', (int) $status['failing_since'] ) ),
+		esc_html( mb_substr( (string) $status['error'], 0, 200 ) ),
+		esc_url( admin_url( 'options-general.php?page=bv-instagram-feed' ) )
+	);
+}
+add_action( 'admin_notices', 'bv_instagram_admin_notice' );
 
 // Admin settings page.
 function bv_instagram_settings_menu() {
@@ -420,11 +501,26 @@ function bv_instagram_settings_page() {
 		$token  = isset( $_POST['bv_ig_token'] ) ? trim( (string) wp_unslash( $_POST['bv_ig_token'] ) ) : '';
 		$ig_id  = isset( $_POST['bv_ig_user_id'] ) ? preg_replace( '/\D/', '', (string) wp_unslash( $_POST['bv_ig_user_id'] ) ) : '';
 		$cdn_url = isset( $_POST['bv_ig_cdn_url'] ) ? trim( esc_url_raw( wp_unslash( $_POST['bv_ig_cdn_url'] ) ) ) : '';
-		update_option( BV_IG_OPTION_TOKEN, $token );
+		// The field never shows the saved token, so blank means "keep it";
+		// clearing takes the checkbox (saving any other setting used to wipe it).
+		if ( $token !== '' ) {
+			update_option( BV_IG_OPTION_TOKEN, $token );
+		} elseif ( ! empty( $_POST['bv_ig_clear_token'] ) ) {
+			update_option( BV_IG_OPTION_TOKEN, '' );
+		}
 		update_option( BV_IG_OPTION_IG_ID, $ig_id );
 		update_option( BV_IG_OPTION_CDN_URL, $cdn_url );
 		echo '<div class="updated"><p>Settings saved.</p></div>';
 	}
+	if ( isset( $_POST['bv_ig_test_nonce'] ) && wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['bv_ig_test_nonce'] ) ), 'bv_ig_test' ) ) {
+		delete_transient( 'bv_ig_media_12_m' );
+		delete_transient( 'bv_ig_user_id' );
+		$items = bv_instagram_fetch_media( 12, 'm' );
+		echo $items
+			? '<div class="updated"><p>Feed works: ' . count( $items ) . ' posts loaded.</p></div>'
+			: '<div class="error"><p>Feed failed: ' . esc_html( (string) get_transient( 'bv_ig_last_error' ) ) . '</p></div>';
+	}
+	$status = get_option( BV_IG_OPTION_STATUS, array() );
 
 	$token = get_option( BV_IG_OPTION_TOKEN, '' );
 	$ig_id = get_option( BV_IG_OPTION_IG_ID, '' );
@@ -433,6 +529,20 @@ function bv_instagram_settings_page() {
 	?>
 	<div class="wrap">
 		<h1>BV Instagram Feed</h1>
+		<p>
+			<strong>Status:</strong>
+			<?php if ( empty( $status ) ) : ?>
+				not checked yet
+			<?php elseif ( ! empty( $status['ok'] ) ) : ?>
+				<span style="color:#008a20">working</span> (checked <?php echo esc_html( human_time_diff( (int) $status['checked'] ) ); ?> ago)
+			<?php else : ?>
+				<span style="color:#d63638">failing since <?php echo esc_html( gmdate( 'M j, Y', (int) $status['failing_since'] ) ); ?></span>: <?php echo esc_html( (string) $status['error'] ); ?>
+			<?php endif; ?>
+		</p>
+		<form method="post" style="margin-bottom:1em">
+			<?php wp_nonce_field( 'bv_ig_test', 'bv_ig_test_nonce' ); ?>
+			<?php submit_button( 'Test now', 'secondary', 'bv_ig_test', false ); ?>
+		</form>
 		<form method="post">
 			<?php wp_nonce_field( 'bv_ig_settings_save', 'bv_ig_settings_nonce' ); ?>
 			<table class="form-table" role="presentation">
@@ -440,7 +550,8 @@ function bv_instagram_settings_page() {
 					<th scope="row"><label for="bv_ig_token">Access token</label></th>
 					<td>
 						<input type="password" id="bv_ig_token" name="bv_ig_token" class="regular-text" value="" placeholder="<?php echo esc_attr( $token_placeholder ); ?>" autocomplete="off" />
-						<p class="description">Long-lived token (auto-refreshed daily). Leave blank to clear. Constants BV_IG_TOKEN / BV_IG_USER_ID override when set.</p>
+						<p class="description">Use a token that doesn't expire: a system user token from Meta Business settings (permissions instagram_basic, pages_show_list, pages_read_engagement). Leave blank to keep the saved token. Constant BV_IG_USER_ID overrides the ID below.</p>
+							<label><input type="checkbox" name="bv_ig_clear_token" value="1" /> Clear saved token</label>
 					</td>
 				</tr>
 				<tr>
